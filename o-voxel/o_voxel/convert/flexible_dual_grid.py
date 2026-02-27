@@ -14,7 +14,7 @@ __all__ = [
 @torch.no_grad()
 def tiled_flexible_dual_grid_to_mesh(
     coords, dual_vertices, intersected_flag, split_weight, 
-    aabb, grid_size, tile_size=128, overlap=1, train=False
+    aabb, grid_size, tile_size=128, overlap=1, train=False, verbose=False
     ):
     device = coords.device
     
@@ -22,10 +22,12 @@ def tiled_flexible_dual_grid_to_mesh(
     min_coord = coords.min(dim=0).values
     max_coord = coords.max(dim=0).values
     
-    # Calculate ranges on CPU just for the loop logic
-    x_range = range(min_coord[0].item(), max_coord[0].item() + 1, tile_size)
-    y_range = range(min_coord[1].item(), max_coord[1].item() + 1, tile_size)
-    z_range = range(min_coord[2].item(), max_coord[2].item() + 1, tile_size)
+    # Calculate ranges on CPU just once - convert to numpy for efficiency
+    min_np = min_coord.cpu().numpy()
+    max_np = max_coord.cpu().numpy()
+    x_range = range(int(min_np[0]), int(max_np[0]) + 1, tile_size)
+    y_range = range(int(min_np[1]), int(max_np[1]) + 1, tile_size)
+    z_range = range(int(min_np[2]), int(max_np[2]) + 1, tile_size)
     
     all_vertices, all_faces = [], []
     vertex_count = 0
@@ -35,8 +37,8 @@ def tiled_flexible_dual_grid_to_mesh(
     for x in x_range:
         for y in y_range:
             for z in z_range:
-                # 1. Masking directly on GPU
-                lower = torch.tensor([x, y, z], device=device)
+                # 1. Masking directly on GPU with proper dtype
+                lower = torch.tensor([x, y, z], dtype=torch.long, device=device)
                 upper = lower + tile_size
                 mask = torch.all((coords >= lower - overlap) & (coords < upper + overlap), dim=1)
                 
@@ -62,17 +64,22 @@ def tiled_flexible_dual_grid_to_mesh(
                             all_vertices.append(t_verts)
                             all_faces.append(t_faces + vertex_count)
                             vertex_count += t_verts.shape[0]
-                    except RuntimeError:
+                    except RuntimeError as e:
+                        if verbose:
+                            print(f"Tile ({x}, {y}, {z}) failed: {e}")
                         continue
                 
                 pbar.update(1)
     
     pbar.close()
-    if not all_vertices: return None, None
+    if not all_vertices: 
+        return None, None
 
-    # Final Merge and Deduplication
-    unique_v, inverse = torch.unique(torch.cat(all_vertices, dim=0), dim=0, return_inverse=True)
-    return unique_v, inverse[torch.cat(all_faces, dim=0)]
+    # Final Merge and Deduplication - optimize concatenation
+    all_vertices_cat = torch.cat(all_vertices, dim=0)
+    all_faces_cat = torch.cat(all_faces, dim=0)
+    unique_v, inverse = torch.unique(all_vertices_cat, dim=0, return_inverse=True)
+    return unique_v, inverse[all_faces_cat]
 
 
 def _init_hashmap(grid_size, capacity, device):
@@ -84,7 +91,7 @@ def _init_hashmap(grid_size, capacity, device):
     elif VOL < 2**64:
         hashmap_keys = torch.full((capacity,), torch.iinfo(torch.uint64).max, dtype=torch.uint64, device=device)
     else:
-        raise ValueError(f"The spatial size is too large to fit in a hashmap. Get volumn {VOL} > 2^64.")
+        raise ValueError(f"The spatial size is too large to fit in a hashmap. Get volume {VOL} > 2^64.")
 
     hashmap_vals = torch.zeros((capacity,), dtype=torch.uint32, device=device)
     
@@ -205,6 +212,25 @@ def mesh_to_flexible_dual_grid(
     return ret
 
 
+# Device-aware cache for static tensors
+_STATIC_TENSOR_CACHE = {}
+
+def _get_static_tensors(device):
+    """Get or create device-specific static tensors for mesh extraction."""
+    if device not in _STATIC_TENSOR_CACHE:
+        _STATIC_TENSOR_CACHE[device] = {
+            'edge_neighbor_voxel_offset': torch.tensor([
+                [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],     # x-axis
+                [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],     # y-axis
+                [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],     # z-axis
+            ], dtype=torch.int, device=device).unsqueeze(0),
+            'quad_split_1': torch.tensor([0, 1, 2, 0, 2, 3], dtype=torch.long, device=device),
+            'quad_split_2': torch.tensor([0, 1, 3, 3, 1, 2], dtype=torch.long, device=device),
+            'quad_split_train': torch.tensor([0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4], dtype=torch.long, device=device)
+        }
+    return _STATIC_TENSOR_CACHE[device]
+
+
 def flexible_dual_grid_to_mesh(
     coords: torch.Tensor,
     dual_vertices: torch.Tensor,
@@ -234,29 +260,28 @@ def flexible_dual_grid_to_mesh(
         vertices (torch.Tensor): The vertices of the mesh.
         faces (torch.Tensor): The faces of the mesh.
     """
-    # Static variables
-    if not hasattr(flexible_dual_grid_to_mesh, "edge_neighbor_voxel_offset"):
-        flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset = torch.tensor([
-            [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]],     # x-axis
-            [[0, 0, 0], [1, 0, 0], [1, 0, 1], [0, 0, 1]],     # y-axis
-            [[0, 0, 0], [0, 1, 0], [1, 1, 0], [1, 0, 0]],     # z-axis
-        ], dtype=torch.int, device=coords.device).unsqueeze(0)
-    if not hasattr(flexible_dual_grid_to_mesh, "quad_split_1"):
-        flexible_dual_grid_to_mesh.quad_split_1 = torch.tensor([0, 1, 2, 0, 2, 3], dtype=torch.long, device=coords.device, requires_grad=False)
-    if not hasattr(flexible_dual_grid_to_mesh, "quad_split_2"):
-        flexible_dual_grid_to_mesh.quad_split_2 = torch.tensor([0, 1, 3, 3, 1, 2], dtype=torch.long, device=coords.device, requires_grad=False)
-    if not hasattr(flexible_dual_grid_to_mesh, "quad_split_train"):
-        flexible_dual_grid_to_mesh.quad_split_train = torch.tensor([0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4], dtype=torch.long, device=coords.device, requires_grad=False)
+    device = coords.device
+    
+    # Get device-specific static tensors
+    static = _get_static_tensors(device)
+    edge_neighbor_voxel_offset = static['edge_neighbor_voxel_offset']
+    quad_split_1 = static['quad_split_1']
+    quad_split_2 = static['quad_split_2']
+    quad_split_train = static['quad_split_train']
 
     # AABB
     if isinstance(aabb, (list, tuple)):
         aabb = np.array(aabb)
     if isinstance(aabb, np.ndarray):
-        aabb = torch.tensor(aabb, dtype=torch.float32, device=coords.device)
+        aabb = torch.tensor(aabb, dtype=torch.float32, device=device)
     assert isinstance(aabb, torch.Tensor), f"aabb must be a list, tuple, np.ndarray, or torch.Tensor, but got {type(aabb)}"
     assert aabb.dim() == 2, f"aabb must be a 2D tensor, but got {aabb.shape}"
     assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
     assert aabb.size(1) == 3, f"aabb must have 3 columns, but got {aabb.size(1)}"
+    
+    # Ensure aabb is on the correct device
+    if aabb.device != device:
+        aabb = aabb.to(device)
 
     # Voxel size
     if voxel_size is not None:
@@ -265,7 +290,7 @@ def flexible_dual_grid_to_mesh(
         if isinstance(voxel_size, (list, tuple)):
             voxel_size = np.array(voxel_size)
         if isinstance(voxel_size, np.ndarray):
-            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=coords.device)
+            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=device)
         grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
     else:
         assert grid_size is not None, "Either voxel_size or grid_size must be provided"
@@ -274,7 +299,7 @@ def flexible_dual_grid_to_mesh(
         if isinstance(grid_size, (list, tuple)):
             grid_size = np.array(grid_size)
         if isinstance(grid_size, np.ndarray):
-            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=coords.device)
+            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=device)
         voxel_size = (aabb[1] - aabb[0]) / grid_size
     assert isinstance(voxel_size, torch.Tensor), f"voxel_size must be a float, list, tuple, np.ndarray, or torch.Tensor, but got {type(voxel_size)}"
     assert voxel_size.dim() == 1, f"voxel_size must be a 1D tensor, but got {voxel_size.shape}"
@@ -285,20 +310,20 @@ def flexible_dual_grid_to_mesh(
 
     # Extract mesh
     N = dual_vertices.shape[0]
-    mesh_vertices = (coords.float() + dual_vertices * 0.5) / grid_size - 0.5
 
     # Store active voxels into hashmap
-    hashmap = _init_hashmap(grid_size, 2 * N, device=coords.device)
+    hashmap = _init_hashmap(grid_size, 2 * N, device=device)
     _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1), *grid_size.tolist())
 
     # Find connected voxels
-    edge_neighbor_voxel = coords.reshape(N, 1, 1, 3) + flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset      # (N, 3, 4, 3)
+    edge_neighbor_voxel = coords.reshape(N, 1, 1, 3) + edge_neighbor_voxel_offset      # (N, 3, 4, 3)
     connected_voxel = edge_neighbor_voxel[intersected_flag]                           # (M, 4, 3)
     M = connected_voxel.shape[0]
-    connected_voxel_hash_key = torch.cat([
-        torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
-        connected_voxel.reshape(-1, 3)
-    ], dim=1)
+    
+    # Optimized hash key creation - pre-allocate instead of concatenating
+    connected_voxel_hash_key = torch.zeros((M * 4, 4), dtype=torch.int, device=device)
+    connected_voxel_hash_key[:, 1:] = connected_voxel.reshape(-1, 3)
+    
     connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap, connected_voxel_hash_key, *grid_size.tolist()).reshape(M, 4).int()
     connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
     quad_indices = connected_voxel_indices[connected_voxel_valid].int()                             # (L, 4)
@@ -308,7 +333,7 @@ def flexible_dual_grid_to_mesh(
     if not train:
         mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
         chunk_size = 1048576 # 2^20
-        mesh_triangles = torch.empty((L * 2, 3), dtype=torch.int32, device=coords.device)
+        mesh_triangles = torch.empty((L * 2, 3), dtype=torch.int32, device=device)
         
         for i in range(0, L, chunk_size):
             end = min(i + chunk_size, L)
@@ -316,15 +341,7 @@ def flexible_dual_grid_to_mesh(
             
             if split_weight is None:
                 # if split 1
-                atempt_triangles_0 = quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_1]
-                v0 = mesh_vertices[atempt_triangles_0[:, 0]]
-                v1 = mesh_vertices[atempt_triangles_0[:, 1]]
-                v2 = mesh_vertices[atempt_triangles_0[:, 2]]
-                v3 = mesh_vertices[atempt_triangles_0[:, 3]] # Wait, split 1 is 0,1,2, 0,2,3
-                # Re-indexing to get correct vertices for normals
-                # split_1: [0, 1, 2, 0, 2, 3] -> triangles (0,1,2) and (0,2,3)
-                # Actually atempt_triangles_0 is (chunk_size, 6)
-                # Let's be more precise
+                atempt_triangles_0 = quad_indices_chunk[:, quad_split_1]
                 t0 = atempt_triangles_0[:, :3]
                 t1 = atempt_triangles_0[:, 3:]
                 normals0 = torch.cross(mesh_vertices[t0[:, 1]] - mesh_vertices[t0[:, 0]], mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 0]])
@@ -332,7 +349,7 @@ def flexible_dual_grid_to_mesh(
                 align0 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
                 
                 # if split 2
-                atempt_triangles_1 = quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_2]
+                atempt_triangles_1 = quad_indices_chunk[:, quad_split_2]
                 t0 = atempt_triangles_1[:, :3]
                 t1 = atempt_triangles_1[:, 3:]
                 normals0 = torch.cross(mesh_vertices[t0[:, 1]] - mesh_vertices[t0[:, 0]], mesh_vertices[t0[:, 2]] - mesh_vertices[t0[:, 0]])
@@ -347,8 +364,8 @@ def flexible_dual_grid_to_mesh(
                 split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
                 mesh_triangles[i*2:end*2] = torch.where(
                     split_weight_ws_02 > split_weight_ws_13,
-                    quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_1],
-                    quad_indices_chunk[:, flexible_dual_grid_to_mesh.quad_split_2]
+                    quad_indices_chunk[:, quad_split_1],
+                    quad_indices_chunk[:, quad_split_2]
                 ).reshape(-1, 3)
     else:
         assert split_weight is not None, "split_weight must be provided in training mode"
@@ -364,7 +381,12 @@ def flexible_dual_grid_to_mesh(
             split_weight_ws_13 * mean_v13
         ) / (split_weight_ws_02 + split_weight_ws_13)
         mesh_vertices = torch.cat([mesh_vertices, mid_vertices], dim=0)
-        quad_indices = torch.cat([quad_indices, torch.arange(N, N + L, device='cuda').unsqueeze(1)], dim=1)
-        mesh_triangles = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_train].reshape(-1, 3)
+        
+        # FIXED: Use correct device instead of hardcoded 'cuda'
+        quad_indices = torch.cat([
+            quad_indices, 
+            torch.arange(N, N + L, dtype=torch.long, device=device).unsqueeze(1)
+        ], dim=1)
+        mesh_triangles = quad_indices[:, quad_split_train].reshape(-1, 3)
     
     return mesh_vertices, mesh_triangles
